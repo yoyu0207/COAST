@@ -1,12 +1,4 @@
-"""
-SPGmodule.py — Spatial Prior Gate
-零初始化残差通道注意力门控，可插入任意空间特征图。
-
-前向公式：
-    A     = σ(Conv1x1(P_aligned))        # 通道注意力图
-    F_out = F + γ · (F ⊙ A)             # 残差门控
-γ 初始化为 0，保证训练起点与无先验基线完全等价。
-"""
+"""Residual spatial prior gating: F_out = F + gamma * (F * attention)."""
 
 import torch
 import torch.nn as nn

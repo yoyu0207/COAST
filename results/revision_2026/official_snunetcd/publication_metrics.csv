@@ -1,2 +1,0 @@
-model,f1_mean,f1_sd,pr_auc_mean,pr_auc_sd,boundary_f1_mean,boundary_f1_sd,patch_area_mae_pp_mean,patch_area_mae_pp_sd,brier_mean,brier_sd,ece_mean,ece_sd,val_selected_threshold_mean,val_threshold_test_f1_mean,parameters_million,latency_ms,peak_memory_mb
-SNUNetCDOfficial,0.9387109143952591,0.016970484127045393,0.9849464278841396,0.006226497457942776,0.7613706914650563,0.046284420456177255,1.2379047232614437,0.5317247281659134,0.013630348667561062,0.003941478212247036,0.012149585896576044,0.004933897775987391,0.462,0.9392544639708053,nan,,

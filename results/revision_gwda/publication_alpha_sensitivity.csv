@@ -1,4 +1,0 @@
-alpha,selection_split,n,validation_f1_mean_sd,test_metrics_used_for_selection
-0.05,validation,5,0.8148 +/- 0.0073,no
-0.10,validation,5,0.8142 +/- 0.0066,no
-0.20,validation,5,0.8130 +/- 0.0049,no

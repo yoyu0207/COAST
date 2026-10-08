@@ -1,244 +1,117 @@
-# BiT-GeoPrior
+# COAST
 
-<div align="center">
+**Online ecological-prior-guided bitemporal Transformer for mapping potential *Spartina alterniflora* eradication areas in coastal tidal flats**
 
-**Bi-temporal Transformer with Ecologically-informed Geographic Prior for Coastal Wetland Change Detection**
+COAST combines bitemporal Sentinel-2 features with an online ecological prior learned from GWDA posterior soft targets. The prior is generated from the pre-eradication image and gates the paired semantic features. A multi-scale decoder produces the change map; an auxiliary boundary head supplies supervision during training.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
+![COAST architecture](assets/architecture.svg)
 
-</div>
-
-## Abstract
-
-Accurate monitoring of *Spartina alterniflora* (cordgrass) dynamics in coastal wetlands is critical for ecological conservation, yet remains challenging due to spectral confusion and tidal complexity. We propose **BiT-GeoPrior**, a bi-temporal change detection framework that integrates geographic prior knowledge into deep neural networks via a lightweight, zero-initialized **Spatial Prior Gate (SPG)**. The framework supports both **static priors** (GWR-based local *R*², GWDA posterior probability) and an **online ecological prior encoder** that estimates prior maps end-to-end from satellite imagery—eliminating the need for precomputed auxiliary data.
-
-## Architecture
-
-<div align="center">
-  <img src="assets/architecture.png" alt="BiT-GeoPrior Architecture" width="90%">
-  <p><em>Overall architecture: Bi-temporal Transformer with Spatial Prior Gate injection.</em></p>
-</div>
-
-### Spatial Prior Gate (SPG)
-
-The SPG is a zero-initialized residual attention gate that injects prior knowledge into intermediate feature maps:
-
-<div align="center">
-  <img src="assets/spg_module.svg" alt="Spatial Prior Gate" width="50%">
-  <p><em>SPG: residual channel attention with zero-initialized learnable gain γ. At initialization, the model is strictly equivalent to a prior-free baseline.</em></p>
-</div>
-
-$$
-\mathbf{F}_{out} = \mathbf{F} + \gamma \cdot (\mathbf{F} \odot \sigma(\text{Conv}_{1\times1}(\mathbf{P})))
-$$
-
-Key properties:
-- **Identity at initialization** — γ starts at 0, ensuring training begins identically to the baseline
-- **Plug-and-play** — can be inserted into any Siamese change detection network
-- **Interpretable γ** — the learned gain reveals how strongly the model relies on prior knowledge
-
-## Models
-
-| Model | Prior Type | Description |
-|-------|-----------|-------------|
-| `SNUNet` | None | Siamese Nested U-Net baseline (ECCV 2020) |
-| `SNUNet_GeoAware` | Static | SNUNet + SPG at shallow decoder layers |
-| `FCSiamDiff_Aligned` | None | Fully Convolutional Siamese Difference |
-| `BiT` | None | Bi-temporal Transformer (ResNet-18 + Transformer Encoder) |
-| `BiT_GWR` | Static GWR | BiT + GWR local-*R*² prior |
-| `BiT_GWDA` | Static GWDA | BiT + GWDA posterior probability prior |
-| `BiT_Online` | **Online** | BiT + learnable ecological prior encoder (no static files) |
-| `ChangeFormer` | None | Hierarchical Transformer |
-
-## Results
-
-### Qualitative Comparison
-
-<div align="center">
-  <img src="assets/qualitative_results.png" alt="Qualitative Comparison" width="100%">
-  <p><em>Qualitative comparison across representative coastal wetland scenes. BiT_Online consistently reduces false positives in spectrally ambiguous regions.</em></p>
-</div>
-
-### Ablation Study
-
-<div align="center">
-  <img src="assets/ablation_comparison.png" alt="Ablation Study" width="70%">
-  <p><em>Ablation results: prior injection consistently improves F1 across all base architectures.</em></p>
-</div>
-
-### Training Dynamics
-
-<div align="center">
-  <img src="assets/training_curves.png" alt="Training Curves" width="70%">
-  <p><em>Training and validation curves. Left: loss convergence. Right: F1 progression.</em></p>
-</div>
-
-### Estuary Transfer Performance
-
-<div align="center">
-  <img src="assets/transfer_results.png" alt="Transfer Results" width="70%">
-  <p><em>Spatial transfer across different estuaries demonstrates generalization capability.</em></p>
-</div>
+*Framework overview from the current manuscript.*
 
 ## Installation
 
-```bash
-git clone https://github.com/yoyu0207/BiT-GeoPrior.git
-cd BiT-GeoPrior
-pip install -r requirements.txt
-```
-
-### Requirements
-
-- Python ≥ 3.10
-- PyTorch ≥ 2.0
-- torchvision ≥ 0.15
-
-## Dataset Structure
-
-```
-data_root/
-├── A/                     # T1 Sentinel-2 patches (.npy, [8, H, W])
-├── B/                     # T2 Sentinel-2 patches (.npy, [8, H, W])
-├── label/                 # Binary change labels (.npy or .png)
-├── spatial_prior_gwr/     # (optional) GWR prior patches [0, 1]
-├── spatial_prior_gwda/    # (optional) GWDA prior patches [0, 1]
-└── spatial_split_manifest.csv
-```
-
-8-channel composition: **B8, B4, B3, B2, NDVI, EVI, SAVI, GNDVI**
-
-### Spatially independent split
-
-Overlapping image patches must not be randomly divided between training and
-validation sets. Generate an explicit spatial manifest before training:
+Python 3.10 or newer is required. The implementation has been checked with PyTorch 2.5.1 and torchvision 0.20.1. For GPU execution, install a matching PyTorch/torchvision build for your CUDA environment from [PyTorch](https://pytorch.org/get-started/locally/) before installing the remaining requirements.
 
 ```bash
-python make_spatial_split.py \
-  --data_root /path/to/data_root \
-  --block_size 2048 \
-  --patch_size 256 \
-  --buffer 256 \
-  --seed 42
+git clone https://github.com/yoyu0207/COAST.git
+cd COAST
+python -m pip install -r requirements.txt
 ```
 
-For 10 m Sentinel-2 imagery, this configuration uses approximately 20.48 km
-spatial blocks and a 2.56 km exclusion buffer between train, validation, and
-test patches. Samples in the buffer are retained in the manifest as
-`excluded` for auditability. The validation set is used for checkpoint
-selection; the test set is evaluated only after training.
+The ResNet-18 backbone is initialized with `weights=None`: no ImageNet weights are downloaded.
 
-### Leakage-safe GWDA teacher
+## Data preparation
 
-The revised GWDA workflow fits the teacher exclusively with samples from the
-training spatial blocks. Validation and test labels are not used for feature
-standardisation, adaptive-bandwidth selection, model fitting, or probability
-calibration:
+Prepare co-registered, 10 m resolution image patches as NumPy arrays:
+
+```text
+data/
+  A/                         T1 arrays, float32 [8, 256, 256]
+  B/                         T2 arrays, float32 [8, 256, 256]
+  label/                     Binary reference arrays, [256, 256], values 0/1
+  spatial_split_manifest.csv Spatial train/val/test assignments
+  spatial_prior_gwda_oof/     Generated posterior targets for training
+```
+
+Corresponding files share a name, for example `EstuariesA_1024_2048.npy`. The final two numbers are upper-left pixel coordinates in the source raster; the preceding text identifies the source region. Labels represent **removal-related change**, not species presence/absence.
+
+The eight channels are ordered **B8, B4, B3, B2, NDVI, EVI, SAVI, GNDVI**. Convert optical-band digital numbers to surface reflectance before computing the indices. Inputs must already be aligned and scaled; the loader applies no additional radiometric normalization.
+
+For the original patch collection, copy the published [split manifest](splits/spatial_split_2048px_buffer256_seed42.csv) to `data/spatial_split_manifest.csv`. For a new dataset, generate a spatial split:
 
 ```bash
-python build_gwda_prior.py \
-  --data_root /path/to/data_root \
-  --output_dir /path/to/data_root/spatial_prior_gwda_train_only
+python -m tools.make_spatial_split --data_root data --block_size 2048 --buffer 256 --seed 42
 ```
 
-The command records the fitting sample provenance, spatial-block
-cross-validation results, selected adaptive Gaussian bandwidth, isotonic
-calibration parameters, and teacher-only diagnostics in
-`gwda_metadata.json`. The new revision experiments do not use GWR priors.
+The manifest records `filename, region, x, y, block_x, block_y, split`; buffered patches can be marked `excluded`. The original split contains 313 training, 59 validation and 71 test patches. Pass an existing manifest using `--split_manifest` for training/evaluation or `--manifest` for GWDA preparation.
 
-### Multi-seed revision experiments
-
-Run the complete five-seed baseline and control matrix with:
+### GWDA posterior targets
 
 ```bash
-python run_revision_experiments.py \
-  --python /path/to/python \
-  --data_root /path/to/data_root \
-  --epochs 200 \
-  --patience 30
+python -m tools.build_gwda_prior_oof --data_root data --sample_stride 16 --prediction_stride 16 --seed 42
 ```
 
-The matrix includes FC-SiamDiff, SNUNet, ChangeFormer, BiT, train-only
-BiT-GWDA, OEP-BiT, COAST, shuffled-prior, random-prior, no-gating, and
-distillation-weight sensitivity controls. It writes per-run metadata,
-mean/standard deviation summaries, paired bootstrap confidence intervals,
-paired t-tests, and Wilcoxon tests. Distillation-weight sensitivity runs use
-the validation set only and do not access the test set.
+Each training block is held out from GWDA fitting, feature standardization, bandwidth selection and isotonic calibration. Inner spatial cross-validation selects the adaptive Gaussian bandwidth by Brier score. Validation/test posterior maps are generated from training blocks only. The original dataset gives 19 outer folds.
 
-## Quick Start
+The command saves posterior patches and fold metadata in `data/spatial_prior_gwda_oof/`. Interrupted runs can resume with unchanged inputs and settings. Use a new output directory after changing source images, labels, the manifest or GWDA settings.
 
-### Training
+**GWDA targets are used for training supervision only. Evaluation and prediction do not require posterior maps.**
+
+## Training
 
 ```bash
-# Baseline (no prior)
-python train.py --model SNUNet --epochs 200
-python train.py --model BiT --lr 6e-5 --epochs 200
-python train.py --model ChangeFormer --epochs 200
-
-# With static prior (requires spatial_prior_gwr/ or spatial_prior_gwda/)
-python train.py --model BiT_GWR --lr 6e-5 --epochs 200
-python train.py --model BiT_GWDA --lr 6e-5 --epochs 200
-
-# With online prior (no static files needed)
-python train.py --model BiT_Online --lr 6e-5 --epochs 200
+python train.py --data_root data --seed 42 --epochs 200 --batch_size 8 --alpha 0.1 --spg_lr 0.0001 --boundary_weight 0.2 --amp
 ```
 
-Training uses `data_root/spatial_split_manifest.csv` by default. Set
-`--split_manifest` to use another manifest and `--seed` for repeated runs.
-The legacy random patch split is available only through the explicit
-`--allow_random_patch_split` flag and should not be used for independent
-spatial validation.
+Defaults use AdamW, a base learning rate of `5e-5`, an online-prior learning rate of `5e-5`, and a gating learning rate of `1e-4`. The base loss combines BCE and Dice; posterior MSE and auxiliary boundary supervision have weights `0.1` and `0.2`. StepLR halves learning rates every 30 epochs.
 
-### Evaluation
+Runs save `best_model.pth`, `training_log.csv`, `config.json`, `summary.json` and the split manifest under `experiments/`. Checkpoints are selected by validation F1. The default budget is 200 epochs with patience 60; `--patience 0` disables early stopping. Use `--skip_test` for validation-only configuration selection. The manuscript uses seeds **42, 1337 and 3407**.
+
+## Evaluation and prediction
+
+Evaluate a saved checkpoint on the fixed test split:
 
 ```bash
-python evaluate.py \
-  --model BiT_GWR \
-  --pth checkpoints/BiT_GWR/best_model.pth \
-  --split test
+python evaluate.py --data_root data --checkpoint experiments/YOUR_RUN/best_model.pth --output experiments/YOUR_RUN/test_metrics.json
 ```
 
-## Project Structure
+OA, Precision, Recall, F1 and IoU are computed from pooled pixel confusion counts at a default threshold of 0.5. Overlapping pixels are counted separately in their respective patches.
 
-```
-├── models/
-│   ├── __init__.py
-│   ├── snunet.py                  # SNUNet & SNUNet_GeoAware
-│   ├── FC_Siam_diff.py            # FC-Siam-Diff
-│   ├── bit.py                     # BiT baseline
-│   ├── bit_gwr.py                 # BiT + GWR prior
-│   ├── bit_gwda.py                # BiT + GWDA prior
-│   ├── bit_online.py              # BiT + online prior
-│   ├── changeformer.py            # ChangeFormer
-│   ├── SPGmodule.py               # Spatial Prior Gate
-│   ├── ecological_prior.py        # Online prior encoder
-│   └── transformer_block.py       # Shared Transformer block
-├── train.py                       # Training entry point
-├── dataset.py                     # Data loader with augmentation
-├── make_spatial_split.py          # Leakage-safe spatial split generator
-├── losses.py                      # BCE + Dice hybrid loss
-├── utils.py                       # Metric tracker (IoU, F1, etc.)
-├── evaluate.py                    # Standalone evaluation
-├── splits/                        # Versioned split manifests and summaries
-├── assets/                        # README figures
-├── requirements.txt
-├── LICENSE
-└── README.md
+Predict a single aligned pair without labels or precomputed priors:
+
+```bash
+python predict.py --t1 data/A/EstuariesA_1024_2048.npy --t2 data/B/EstuariesA_1024_2048.npy --checkpoint experiments/YOUR_RUN/best_model.pth --output_dir predictions/example
 ```
 
-## Citation
+Outputs are `change_probability.npy`, `online_prior.npy` and `change_mask.png`. This entry point handles 256 x 256 patches; it does not perform raster reprojection or full-scene mosaicking.
 
-```bibtex
-@article{...,
-  title     = {...},
-  author    = {...},
-  journal   = {...},
-  year      = {2025}
-}
+```python
+import torch
+from models import COAST
+
+model = COAST().eval()
+t1 = torch.rand(1, 8, 256, 256)
+t2 = torch.rand(1, 8, 256, 256)
+with torch.no_grad():
+    probability = model(t1, t2).sigmoid()
 ```
 
-## License
+## Example
 
-This project is released under the [MIT License](LICENSE).
+![Cross-year COAST examples](assets/temporal_transfer.png)
+
+*Cross-year examples from the current manuscript. Columns show T1, T2, reference labels and COAST predictions. White: true positive; black: true negative; red: false positive; blue: false negative; grey: invalid data.*
+
+## Availability and checks
+
+This repository contains the COAST implementation and spatial split metadata. Image patches, annotation datasets and trained weights are not bundled. Train a checkpoint with your prepared data before running evaluation or prediction.
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+The tests cover forward/backward execution, checkpoint loading, dataset validation, spatial splitting and GWDA selection.
+
+## Acknowledgements and license
+
+The bitemporal Transformer design builds on [BiT](https://github.com/justchenhao/BIT_CD). The backbone uses [torchvision](https://pytorch.org/vision/stable/). See [LICENSE](LICENSE) for this repository's MIT license.

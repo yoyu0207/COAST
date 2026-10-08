@@ -1,53 +1,18 @@
-# Python
 __pycache__/
 *.py[cod]
-*.so
-*.egg-info/
-dist/
-build/
-
-# Model checkpoints (large files)
-*.pth
-checkpoints/
-checkpoints_*/
-/revision_experiments_gwda/
-/spg_optimization_revision/
-/smoke_matrix/
-/smoke_runs/
-/smoke_spg/
-
-# Data & figures
-*.npz
-*.npy
-*.pdf
-*.png
-*.tif
-*.tiff
-*.svg
-
-# Allow README assets
-!assets/
-!assets/**
-
-# IDE
+.venv/
 .vscode/
 .idea/
-
-# OS
 .DS_Store
 Thumbs.db
-
-# Unrelated / duplicate / deployment scripts
-/SPGmodule.py
-/OSPGmodule.py
-应该是没啥用的/
-edit_manuscript_docx.py
-insert_missing_sections.py
-run_deploy_with_preimport.py
-deploy_bit_online_fullarea.py
-infer_fullarea.py
-GWDA_patch.ipynb
-build_8ch_s2_stack.py
-run_train_all.bat
-visualize_bit.py
-viz_channel_weights.py
+data/
+experiments/
+predictions/
+checkpoints/
+*.pth
+*.pt
+*.npy
+*.npz
+*.tif
+*.tiff
+*.log

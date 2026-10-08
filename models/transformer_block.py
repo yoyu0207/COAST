@@ -1,13 +1,10 @@
-"""
-transformer_block.py — 共用 Transformer Encoder Block
-BiT 系列模型共享同一个 Transformer 块，避免重复定义。
-"""
+"""Shared pre-layer-normalized Transformer encoder block."""
 
 import torch.nn as nn
 
 
 class TransformerBlock(nn.Module):
-    """Pre-LayerNorm Transformer Encoder Block（单层）。"""
+    """Single pre-layer-normalized encoder block."""
 
     def __init__(self, dim: int, heads: int,
                  mlp_dim: int, dropout: float = 0.1):

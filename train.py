@@ -1,352 +1,80 @@
-"""
-train.py — Spartina Change Detection Trainer
-======================================================================
-支持模型：
-  基线（无先验）  : SNUNet | FCSiamDiff | BiT | ChangeFormer
-  输出端先验注入  : SNUNet_GeoAware
-  特征层静态先验  : BiT_GWR | BiT_GWDA
-  特征层在线先验  : BiT_Online
-
-BiT_Online 使用说明
-----------------------------------------------------------------------
-BiT_Online 是纯在线先验模型，先验完全由网络从 T1 影像实时估计，
-不读取任何静态先验文件。在论文消融实验中对应两个条目：
-
-  条目 1  BiT_GWR_Online
-          将 data_root 下 spatial_prior/ 替换为 GWR 先验图后训练
-          （模型本身不使用该文件，但目录名作为实验记录依据）
-          运行命令：
-            python train.py --model BiT_Online --prior_tag GWR_Online
-
-  条目 2  BiT_GWDA_Online
-          将 data_root 下 spatial_prior/ 替换为 GWDA 先验图后训练
-          运行命令：
-            python train.py --model BiT_Online --prior_tag GWDA_Online
-
-  --prior_tag 仅影响 checkpoints 文件夹命名，不影响训练逻辑。
-
-======================================================================
-用法示例：
-  python train.py --model BiT_GWR   --lr 6e-5 --epochs 200
-  python train.py --model BiT_GWDA  --lr 6e-5 --epochs 200
-  python train.py --model BiT_Online --prior_tag GWR_Online  --lr 6e-5 --epochs 200
-  python train.py --model BiT_Online --prior_tag GWDA_Online --lr 6e-5 --epochs 200
-  python train.py --model ChangeFormer --epochs 200
-======================================================================
-"""
+"""Train COAST with spatial-block OOF GWDA posterior soft supervision."""
 
 import os
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
+import argparse
 import csv
 import json
-import random
 import shutil
 import time
-import argparse
+from pathlib import Path
 
-import numpy as np
 import torch
-import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from dataset               import CDDataset
-from models.snunet         import SNUNet, SNUNet_GeoAware
-from models.FC_Siam_diff   import FCSiamDiff_Aligned
-from models.bit            import BiT
-from models.changeformer   import ChangeFormer
-from models.bit_gwr        import BiT_GWR
-from models.bit_gwda       import BiT_GWDA
-from models.bit_online     import BiT_Online
-from models.bit_online_boundary import BiTOnlineBoundary
-from models.recent_baselines import RecentChangeDetector
-from models.official_snunet import OfficialSNUNetCD, SNUNetCDLiteNoECAM
-from losses                import BCEHybridLoss
-from utils                 import MetricTracker
-
-# ── 需要把 spatial_prior 传入 forward() 的模型 ─────────────────────────
-# BiT_Online 虽然在此集合中，但其 forward() 会忽略 spatial_prior 参数
-PRIOR_MODELS = {
-    'SNUNet_GeoAware',
-    'BiT_GWR',
-    'BiT_GWDA',
-    'BiT_Online',
-    'BiT_Online_Boundary',
-}
-
-ONLINE_MODELS = {'BiT_Online', 'BiT_Online_Boundary'}
-
-ALL_MODELS = [
-    'SNUNet', 'SNUNet_GeoAware',
-    'FCSiamDiff',
-    'BiT', 'ChangeFormer',
-    'BiT_GWR', 'BiT_GWDA',
-    'BiT_Online', 'BiT_Online_Boundary',
-    'STeInFormer', 'EdgeRefNet', 'SNUNetCDOfficial', 'SNUNetCDLiteNoECAM',
-]
+from dataset import CDDataset
+from losses import BCEHybridLoss, coast_loss
+from models import COAST
+from utils import MetricTracker, set_global_seed
 
 
-# ──────────────────────────────────────────────────────────────────────
-#  命令行参数
-# ──────────────────────────────────────────────────────────────────────
 def parse_args():
-    parser = argparse.ArgumentParser(description="Change Detection Trainer")
-    parser.add_argument('--model',      type=str, required=True,
-                        choices=ALL_MODELS)
-    parser.add_argument('--lr',         type=float, default=5e-5)
-    parser.add_argument('--epochs',     type=int,   default=100)
-    parser.add_argument('--batch_size', type=int,   default=8)
-    parser.add_argument('--seed',       type=int,   default=42)
-    parser.add_argument(
-        '--deterministic_warn_only', action='store_true',
-        help=(
-            "Keep deterministic seeding, but warn instead of failing when a "
-            "CUDA operator has no deterministic backward implementation."
-        ),
-    )
-    parser.add_argument('--num_workers', type=int, default=0)
-    parser.add_argument('--patience', type=int, default=30,
-                        help="验证 F1 连续多少轮不提升后提前停止；0 表示禁用。")
-    parser.add_argument('--amp', action='store_true',
-                        help="在 CUDA 上启用自动混合精度。")
-    parser.add_argument(
-        '--amp_dtype', choices=['float16', 'bfloat16'], default='float16',
-        help="CUDA 自动混合精度的数据类型。")
-    parser.add_argument('--output_root', type=str, default='experiments')
-    parser.add_argument('--run_name', type=str, default=None)
-    parser.add_argument('--save_every', type=int, default=0,
-                        help="每隔多少轮保存中间权重；0 表示只保留最佳权重。")
-    parser.add_argument('--skip_test', action='store_true',
-                        help="仅用于验证集超参数敏感性分析，不读取测试集。")
-    parser.add_argument('--data_root',  type=str,
-                        default=r"D:/yoyu/SA_Identification/"
-                                r"dataset_patches_2020_2024")
-    parser.add_argument(
-        '--prior_dir', type=str, default=None,
-        help="明确指定先验文件夹名称，例如 spatial_prior_gwr 或 spatial_prior_gwda。"
-             "不填则自动查找。"
-    )
-    parser.add_argument(
-        '--prior_tag', type=str, default='',
-        help="仅用于 BiT_Online 的 checkpoint 文件夹命名，不影响训练逻辑。"
-    )
-    parser.add_argument(
-        '--alpha', type=float, default=0.0,
-        help="GWDA 知识蒸馏损失权重（仅 BiT_Online 有效）。"
-             "0.0 = 不使用蒸馏（默认）；建议从 0.1 开始试。"
-             "需要同时指定 --prior_dir spatial_prior_gwda。"
-    )
-    parser.add_argument(
-        '--prior_control',
-        choices=[
-            'none', 'shuffled', 'random', 'zero', 'constant',
-            'random_per_epoch',
-        ],
-        default='none',
-        help=(
-            "Distillation-target control. 'constant' uses 0.5 everywhere; "
-            "'random_per_epoch' changes deterministically every epoch."
-        ),
-    )
-    parser.add_argument('--no_gating', action='store_true',
-                        help="在线先验仍接受 GWDA 软监督，但不注入变化检测特征。")
-    parser.add_argument(
-        '--prior_only_gating', action='store_true',
-        help=(
-            "直接使用外部空间先验进行 SPG 门控，不使用在线先验进行门控。"
-            "该控制实验应与 --alpha 0 配合使用。"
-        ),
-    )
-    parser.add_argument(
-        '--spg_lr', type=float, default=1e-5,
-        help="SPG 先验投影层学习率。仅对 BiT_Online 有效。")
-    parser.add_argument(
-        '--spg_gamma_lr', type=float, default=None,
-        help="SPG 标量 gamma 的学习率；默认与 --spg_lr 相同。")
-    parser.add_argument(
-        '--boundary_weight', type=float, default=0.2,
-        help="Boundary auxiliary loss weight for BiT_Online_Boundary.")
-    parser.add_argument(
-        '--split_manifest', type=str, default=None,
-        help="空间 train/val/test 划分清单。默认使用 data_root 下的 "
-             "spatial_split_manifest.csv。"
-    )
-    parser.add_argument(
-        '--allow_random_patch_split', action='store_true',
-        help="仅用于复现旧结果。允许使用存在空间泄漏风险的随机 patch 划分。"
-    )
-    return parser.parse_args()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data_root", type=Path, required=True)
+    parser.add_argument("--split_manifest", type=Path)
+    parser.add_argument("--prior_dir", default="spatial_prior_gwda_oof")
+    parser.add_argument("--output_root", type=Path, default=Path("experiments"))
+    parser.add_argument("--run_name")
+    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--patience", type=int, default=60, help="0 disables early stopping")
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--spg_lr", type=float, default=1e-4)
+    parser.add_argument("--spg_gamma_lr", type=float)
+    parser.add_argument("--alpha", type=float, default=0.1)
+    parser.add_argument("--boundary_weight", type=float, default=0.2)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--amp", action="store_true")
+    parser.add_argument("--amp_dtype", choices=["float16", "bfloat16"], default="float16")
+    parser.add_argument("--deterministic_warn_only", action="store_true")
+    parser.add_argument("--skip_test", action="store_true", help="Validation-only configuration selection")
+    args = parser.parse_args()
+    if args.epochs < 1 or args.batch_size < 1 or args.patience < 0:
+        parser.error("epochs/batch_size must be positive; patience must be non-negative")
+    return args
 
 
-def set_global_seed(seed: int, deterministic_warn_only: bool = False) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    torch.use_deterministic_algorithms(
-        True, warn_only=deterministic_warn_only)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
+def build_optimizer(model, lr=5e-5, spg_lr=1e-4, spg_gamma_lr=None):
+    excluded = {id(p) for module in (model.prior_encoder, model.spg1, model.spg2)
+                for p in module.parameters()}
+    gamma = [model.spg1.gamma, model.spg2.gamma]
+    gamma_ids = {id(p) for p in gamma}
+    projection = [p for module in (model.spg1, model.spg2) for p in module.parameters()
+                  if id(p) not in gamma_ids]
+    return torch.optim.AdamW([
+        {"params": [p for p in model.parameters() if id(p) not in excluded], "lr": lr},
+        {"params": list(model.prior_encoder.parameters()), "lr": 5e-5},
+        {"params": projection, "lr": spg_lr},
+        {"params": gamma, "lr": spg_lr if spg_gamma_lr is None else spg_gamma_lr,
+         "weight_decay": 0.0},
+    ], weight_decay=1e-3)
 
 
-# ──────────────────────────────────────────────────────────────────────
-#  模型工厂
-# ──────────────────────────────────────────────────────────────────────
-def build_model(name: str, device, online_use_gating: bool = True,
-                prior_only_gating: bool = False) -> torch.nn.Module:
-    kw = dict(in_channels=8, num_classes=1)
-    mapping = {
-        'SNUNet':          lambda: SNUNet(**kw),
-        'SNUNet_GeoAware': lambda: SNUNet_GeoAware(**kw),
-        'FCSiamDiff':      lambda: FCSiamDiff_Aligned(
-                               in_channels=8, num_classes=1, base_c=32),
-        'BiT':             lambda: BiT(**kw),
-        'ChangeFormer':    lambda: ChangeFormer(**kw),
-        'BiT_GWR':         lambda: BiT_GWR(**kw),
-        'BiT_GWDA':        lambda: BiT_GWDA(**kw),
-        'BiT_Online':      lambda: BiT_Online(
-                               **kw, use_gating=online_use_gating),
-        'BiT_Online_Boundary': lambda: BiTOnlineBoundary(
-                               **kw, use_gating=online_use_gating,
-                               prior_only_gating=prior_only_gating),
-        'STeInFormer':     lambda: RecentChangeDetector('STeInFormer'),
-        'EdgeRefNet':      lambda: RecentChangeDetector('EdgeRefNet'),
-        'SNUNetCDOfficial': lambda: OfficialSNUNetCD(**kw),
-        'SNUNetCDLiteNoECAM': lambda: SNUNetCDLiteNoECAM(**kw),
-    }
-    return mapping[name]().to(device)
-
-
-# ──────────────────────────────────────────────────────────────────────
-#  优化器工厂
-#
-#  学习率分配：
-#    Backbone / Transformer      →  命令行 --lr
-#    在线先验编码器 prior_encoder →  5e-5
-#    SPG 门控参数 spg1 / spg2    →  1e-5（保守更新）
-# ──────────────────────────────────────────────────────────────────────
-def _ids(*modules) -> set:
-    return {id(p) for m in modules for p in m.parameters()}
-
-
-def build_optimizer(model, name: str, lr: float, spg_lr: float = 1e-5,
-                    spg_gamma_lr: float | None = None) -> optim.Optimizer:
-
-    # 静态先验模型：仅 SPG 差异化学习率
-    if name in ('BiT_GWR', 'BiT_GWDA', 'SNUNet_GeoAware'):
-        excl = _ids(model.spg1, model.spg2)
-        base = [p for p in model.parameters() if id(p) not in excl]
-        return optim.AdamW([
-            {'params': base,                            'lr': lr  },
-            {'params': list(model.spg1.parameters()),   'lr': 1e-5},
-            {'params': list(model.spg2.parameters()),   'lr': 1e-5},
-        ], weight_decay=1e-3)
-
-    # 在线先验模型：prior_encoder + SPG 差异化学习率
-    if name in ONLINE_MODELS:
-        excl = _ids(model.prior_encoder, model.spg1, model.spg2)
-        base = [p for p in model.parameters() if id(p) not in excl]
-        gamma = [model.spg1.gamma, model.spg2.gamma]
-        gamma_ids = {id(parameter) for parameter in gamma}
-        spg_projection = [
-            parameter
-            for module in (model.spg1, model.spg2)
-            for parameter in module.parameters()
-            if id(parameter) not in gamma_ids
-        ]
-        gamma_lr = spg_lr if spg_gamma_lr is None else spg_gamma_lr
-        return optim.AdamW([
-            {'params': base,                                    'lr': lr  },
-            {'params': list(model.prior_encoder.parameters()),  'lr': 5e-5},
-            {'params': spg_projection, 'lr': spg_lr},
-            {'params': gamma, 'lr': gamma_lr, 'weight_decay': 0.0},
-        ], weight_decay=1e-3)
-
-    # ChangeFormer：原论文建议较大初始 lr
-    if name == 'ChangeFormer':
-        return optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-3)
-
-    # 其余（SNUNet / FCSiamDiff / BiT）
-    return optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-3)
-
-
-# ──────────────────────────────────────────────────────────────────────
-#  调度器工厂
-# ──────────────────────────────────────────────────────────────────────
-def build_scheduler(optimizer, name: str, epochs: int):
-    if name == 'ChangeFormer':
-        return optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=epochs, eta_min=1e-6)
-    return optim.lr_scheduler.StepLR(
-        optimizer, step_size=30, gamma=0.5)
-
-
-# ──────────────────────────────────────────────────────────────────────
-#  单 epoch 训练 / 验证
-# ──────────────────────────────────────────────────────────────────────
-def train_one_epoch(model, name, loader, criterion, optimizer, device,
-                    alpha: float = 0.0, scaler=None, amp: bool = False,
-                    amp_dtype: torch.dtype = torch.float16,
-                    boundary_weight: float = 0.0):
-    """
-    alpha > 0 且模型为 BiT_Online 时，启用 GWDA 知识蒸馏：
-      L_total = L_cd + alpha * L_distill
-      L_distill = MSE(prior_online, prior_gwda)
-    prior_gwda 来自 dataset 返回的第四个元素（需指定 --prior_dir spatial_prior_gwda）。
-    """
+def train_one_epoch(model, loader, criterion, optimizer, device, alpha=0.1,
+                    boundary_weight=0.2, scaler=None, amp=False, amp_dtype=torch.float16):
     model.train()
-    total      = 0.0
-    use_distil = (alpha > 0.0 and name in ONLINE_MODELS)
-    bar        = tqdm(loader, desc="Train", leave=False)
-
-    for imgA, imgB, label, prior in bar:
-        imgA  = imgA.to(device)
-        imgB  = imgB.to(device)
-        label = label.to(device)
-        prior = prior.to(device)
-
+    total = 0.0
+    for batch in tqdm(loader, desc="Train", leave=False):
+        image_a, image_b, labels, posterior = [item.to(device) for item in batch]
         optimizer.zero_grad(set_to_none=True)
-        with torch.amp.autocast('cuda', enabled=amp, dtype=amp_dtype):
-            boundary_logits = None
-            if name in ONLINE_MODELS:
-                online_output = model(
-                    imgA, imgB, prior, return_prior=True)
-                out, prior_online = online_output[:2]
-                if len(online_output) > 2:
-                    boundary_logits = online_output[2]
-            else:
-                out = (model(imgA, imgB, prior) if name in PRIOR_MODELS
-                       else model(imgA, imgB))
-                prior_online = None
-            if hasattr(model, 'compute_training_loss'):
-                loss = model.compute_training_loss(out, label, criterion)
-            else:
-                loss = (sum(criterion(o, label) for o in out)
-                        if isinstance(out, list) else criterion(out, label))
-            if use_distil:
-                loss_distil = torch.nn.functional.mse_loss(
-                    prior_online, prior)
-                loss = loss + alpha * loss_distil
-            if boundary_logits is not None and boundary_weight > 0.0:
-                dilated = torch.nn.functional.max_pool2d(
-                    label, kernel_size=3, stride=1, padding=1)
-                eroded = -torch.nn.functional.max_pool2d(
-                    -label, kernel_size=3, stride=1, padding=1)
-                boundary_target = ((dilated - eroded) > 0).to(label.dtype)
-                loss = loss + boundary_weight * criterion(
-                    boundary_logits, boundary_target)
-
+        with torch.amp.autocast("cuda", enabled=amp, dtype=amp_dtype):
+            outputs = model(image_a, image_b, return_prior=True)
+            loss = coast_loss(outputs, labels, posterior, criterion, alpha, boundary_weight)
         if not torch.isfinite(loss):
-            raise FloatingPointError(
-                f"Non-finite training loss for {name}; "
-                "check mixed precision and model outputs."
-            )
-
+            raise FloatingPointError("Non-finite COAST training loss")
         if scaler is not None and scaler.is_enabled():
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -354,328 +82,84 @@ def train_one_epoch(model, name, loader, criterion, optimizer, device,
         else:
             loss.backward()
             optimizer.step()
-
         total += loss.item()
-        bar.set_postfix(loss=f"{loss.item():.4f}")
-
     return total / len(loader)
 
 
 @torch.no_grad()
-def validate(model, name, loader, device, tracker):
+def validate(model, loader, device, tracker=None):
     model.eval()
+    tracker = tracker or MetricTracker()
     tracker.reset()
-
-    for imgA, imgB, label, prior in tqdm(loader, desc="Val  ", leave=False):
-        imgA  = imgA.to(device)
-        imgB  = imgB.to(device)
-        label = label.to(device)
-        prior = prior.to(device)
-
-        out = model(imgA, imgB, prior) if name in PRIOR_MODELS \
-              else model(imgA, imgB)
-        if isinstance(out, list):
-            out = out[-1]
-        tracker.update(out, label)
-
+    for image_a, image_b, labels, _ in tqdm(loader, desc="Evaluate", leave=False):
+        tracker.update(model(image_a.to(device), image_b.to(device)), labels.to(device))
     return tracker.get_metrics()
 
 
-def get_gamma(model):
-    """读取 SPG 门控参数；无 SPG 的模型返回 0.0。"""
-    if hasattr(model, 'spg1') and hasattr(model, 'spg2'):
-        return model.spg1.gamma.item(), model.spg2.gamma.item()
-    return 0.0, 0.0
-
-
-@torch.no_grad()
-def evaluate_prior_fidelity(model, name, loader, device):
-    """Measure agreement between the online prior and the supplied target."""
-    if (name not in ONLINE_MODELS or loader is None
-            or getattr(model, 'prior_only_gating', False)):
-        return None
-    model.eval()
-    count = 0
-    sum_pred = 0.0
-    sum_target = 0.0
-    sum_pred_sq = 0.0
-    sum_target_sq = 0.0
-    sum_cross = 0.0
-    sum_abs_error = 0.0
-    sum_sq_error = 0.0
-    for img_a, img_b, _, prior in loader:
-        img_a = img_a.to(device)
-        img_b = img_b.to(device)
-        target = prior.to(device)
-        predicted = model.prior_encoder(img_a)
-        predicted = predicted.float()
-        target = target.float()
-        count += target.numel()
-        sum_pred += predicted.sum().item()
-        sum_target += target.sum().item()
-        sum_pred_sq += predicted.square().sum().item()
-        sum_target_sq += target.square().sum().item()
-        sum_cross += (predicted * target).sum().item()
-        difference = predicted - target
-        sum_abs_error += difference.abs().sum().item()
-        sum_sq_error += difference.square().sum().item()
-    if count == 0:
-        return None
-    covariance = sum_cross - (sum_pred * sum_target / count)
-    pred_variance = sum_pred_sq - (sum_pred * sum_pred / count)
-    target_variance = sum_target_sq - (sum_target * sum_target / count)
-    denominator = max(pred_variance * target_variance, 0.0) ** 0.5
-    correlation = covariance / denominator if denominator > 0.0 else None
-    return {
-        'mse': sum_sq_error / count,
-        'mae': sum_abs_error / count,
-        'pearson_r': correlation,
-        'predicted_mean': sum_pred / count,
-        'target_mean': sum_target / count,
-        'pixel_count': count,
-    }
-
-
-# ──────────────────────────────────────────────────────────────────────
-#  主流程
-# ──────────────────────────────────────────────────────────────────────
 def main():
-    args   = parse_args()
+    args = parse_args()
     set_global_seed(args.seed, args.deterministic_warn_only)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    manifest_path = args.split_manifest
-    if manifest_path is None and not args.allow_random_patch_split:
-        manifest_path = os.path.join(
-            args.data_root, 'spatial_split_manifest.csv')
-    elif manifest_path is not None and not os.path.isabs(manifest_path):
-        manifest_path = os.path.join(args.data_root, manifest_path)
-    if manifest_path is not None:
-        manifest_path = os.path.abspath(manifest_path)
-
-    # checkpoint 文件夹命名
-    # BiT_Online 时附加 prior_tag 以区分 GWR_Online / GWDA_Online
-    tag       = f"_{args.prior_tag}" if args.prior_tag else ""
-    timestamp = time.strftime("%m%d_%H%M%S")
-    run_name = args.run_name or f"{args.model}{tag}_{timestamp}"
-    save_dir = os.path.join(args.output_root, run_name)
-    os.makedirs(save_dir, exist_ok=True)
-    if manifest_path is not None and os.path.exists(manifest_path):
-        shutil.copy2(manifest_path, os.path.join(save_dir, 'split_manifest.csv'))
-
-    print("=" * 60)
-    print(f"  Model      : {args.model}{tag}")
-    print(f"  Device     : {device}")
-    print(f"  LR / Epochs: {args.lr:.1e}  /  {args.epochs}")
-    print(f"  Batch size : {args.batch_size}")
-    print(f"  Seed       : {args.seed}")
-    print(f"  Prior ctrl : {args.prior_control}")
-    print(f"  Gating     : {not args.no_gating}")
-    print(f"  Prior-only : {args.prior_only_gating}")
-    print(f"  SPG LR     : {args.spg_lr:.1e}")
-    print(f"  Gamma LR   : {(args.spg_gamma_lr or args.spg_lr):.1e}")
-    print(f"  Split file : {manifest_path or 'legacy random patch split'}")
-    print(f"  Save dir   : {save_dir}")
-    print("=" * 60)
-
-    # 数据集
-    train_ds = CDDataset(args.data_root, split='train',
-                         split_ratio=0.85, transform=True,
-                         prior_dir_name=args.prior_dir,
-                         manifest_path=manifest_path,
-                         allow_random_split=args.allow_random_patch_split,
-                         prior_control=args.prior_control,
-                         control_seed=args.seed)
-    val_ds   = CDDataset(args.data_root, split='val',
-                         split_ratio=0.85, transform=False,
-                         prior_dir_name=args.prior_dir,
-                         manifest_path=manifest_path,
-                         allow_random_split=args.allow_random_patch_split,
-                         prior_control=args.prior_control,
-                         control_seed=args.seed)
-    test_ds = None
-    if not args.allow_random_patch_split and not args.skip_test:
-        test_ds = CDDataset(args.data_root, split='test',
-                            transform=False,
-                            prior_dir_name=args.prior_dir,
-                            manifest_path=manifest_path,
-                            prior_control=args.prior_control,
-                            control_seed=args.seed)
-
-    loader_generator = torch.Generator()
-    loader_generator.manual_seed(args.seed)
-    train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size,
-        shuffle=True, num_workers=args.num_workers, pin_memory=True,
-        generator=loader_generator)
-    val_loader   = DataLoader(
-        val_ds, batch_size=args.batch_size,
-        shuffle=False, num_workers=args.num_workers, pin_memory=True)
-    test_loader = None if test_ds is None else DataLoader(
-        test_ds, batch_size=args.batch_size,
-        shuffle=False, num_workers=args.num_workers, pin_memory=True)
-
-    # 构建模型 / 优化器 / 调度器
-    if args.no_gating and args.prior_only_gating:
-        raise ValueError("--no_gating and --prior_only_gating are incompatible")
-    if args.prior_only_gating and args.model != 'BiT_Online_Boundary':
-        raise ValueError(
-            "--prior_only_gating is supported only by BiT_Online_Boundary")
-    if args.prior_only_gating and args.alpha != 0.0:
-        raise ValueError("prior-only gating requires --alpha 0")
-
-    model     = build_model(
-        args.model, device, online_use_gating=not args.no_gating,
-        prior_only_gating=args.prior_only_gating)
-    optimizer = build_optimizer(
-        model, args.model, args.lr,
-        spg_lr=args.spg_lr, spg_gamma_lr=args.spg_gamma_lr)
-    scheduler = build_scheduler(optimizer, args.model, args.epochs)
+    root = args.data_root.resolve()
+    manifest = (args.split_manifest.resolve() if args.split_manifest is not None
+                else root / "spatial_split_manifest.csv")
+    train_ds = CDDataset(root, "train", transform=True, prior_dir_name=args.prior_dir,
+                         manifest_path=manifest)
+    val_ds = CDDataset(root, "val", manifest_path=manifest)
+    test_ds = None if args.skip_test else CDDataset(root, "test", manifest_path=manifest)
+    generator = torch.Generator().manual_seed(args.seed)
+    kwargs = dict(batch_size=args.batch_size, num_workers=args.num_workers,
+                  pin_memory=device.type == "cuda")
+    train_loader = DataLoader(train_ds, shuffle=True, generator=generator, **kwargs)
+    val_loader = DataLoader(val_ds, shuffle=False, **kwargs)
+    test_loader = None if test_ds is None else DataLoader(test_ds, shuffle=False, **kwargs)
+    run_name = args.run_name or f"COAST_seed{args.seed}_{time.strftime('%Y%m%d_%H%M%S')}"
+    run_dir = args.output_root / run_name
+    run_dir.mkdir(parents=True, exist_ok=False)
+    shutil.copy2(manifest, run_dir / "split_manifest.csv")
+    configuration = {key: str(value) if isinstance(value, Path) else value
+                     for key, value in vars(args).items()}
+    (run_dir / "config.json").write_text(json.dumps(configuration, indent=2), encoding="utf-8")
+    model = COAST().to(device)
+    optimizer = build_optimizer(model, args.lr, args.spg_lr, args.spg_gamma_lr)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.5)
     criterion = BCEHybridLoss()
-    tracker   = MetricTracker()
-    amp_enabled = bool(args.amp and device.type == 'cuda')
-    amp_dtype = (torch.bfloat16 if args.amp_dtype == 'bfloat16'
-                 else torch.float16)
-    scaler = torch.amp.GradScaler(
-        'cuda', enabled=amp_enabled and amp_dtype == torch.float16)
-
-    # CSV 日志
-    log_path = os.path.join(save_dir, "training_log.csv")
-    with open(log_path, 'w', newline='') as f:
-        csv.writer(f).writerow([
-            'epoch', 'train_loss',
-            'val_iou', 'val_f1', 'val_prec', 'val_rec',
-            'lr', 'gamma1', 'gamma2',
-        ])
-
-    best_val_f1 = -1.0
-    stale_epochs = 0
-    epochs_completed = 0
-
-    for epoch in range(1, args.epochs + 1):
-
-        train_ds.set_epoch(epoch)
-
-        train_loss = train_one_epoch(
-            model, args.model, train_loader, criterion, optimizer, device,
-            alpha=args.alpha, scaler=scaler, amp=amp_enabled,
-            amp_dtype=amp_dtype, boundary_weight=args.boundary_weight)
-        metrics    = validate(
-            model, args.model, val_loader, device, tracker)
-        scheduler.step()
-        epochs_completed = epoch
-
-        lr             = scheduler.get_last_lr()[0]
-        gamma1, gamma2 = get_gamma(model)
-
-        g = f"  g={gamma1:.4f}/{gamma2:.4f}" if (gamma1 or gamma2) else ""
-        print(f"[{epoch:3d}/{args.epochs}]  "
-              f"loss={train_loss:.4f}  "
-              f"F1={metrics['F1']:.4f}  IoU={metrics['IoU']:.4f}  "
-              f"P={metrics['Precision']:.4f}  R={metrics['Recall']:.4f}  "
-              f"lr={lr:.1e}{g}")
-
-        with open(log_path, 'a', newline='') as f:
-            csv.writer(f).writerow([
-                epoch,
-                f"{train_loss:.6f}",
-                f"{metrics['IoU']:.6f}",
-                f"{metrics['F1']:.6f}",
-                f"{metrics['Precision']:.6f}",
-                f"{metrics['Recall']:.6f}",
-                f"{lr:.2e}",
-                f"{gamma1:.6f}",
-                f"{gamma2:.6f}",
-            ])
-
-        if metrics['F1'] > best_val_f1:
-            best_val_f1 = metrics['F1']
-            stale_epochs = 0
-            torch.save(model.state_dict(),
-                       os.path.join(save_dir, "best_model.pth"))
-            print(f"          ↑ best saved  (val F1={best_val_f1:.4f})")
-        else:
-            stale_epochs += 1
-
-        if args.save_every > 0 and epoch % args.save_every == 0:
-            torch.save(model.state_dict(),
-                       os.path.join(save_dir, f"epoch_{epoch}.pth"))
-        if args.patience > 0 and stale_epochs >= args.patience:
-            print(f"          Early stopping after {stale_epochs} stale epochs")
-            break
-
-    best_path = os.path.join(save_dir, "best_model.pth")
-    model.load_state_dict(torch.load(
-        best_path, map_location=device, weights_only=True))
-    best_gamma1, best_gamma2 = get_gamma(model)
-    val_prior_fidelity = evaluate_prior_fidelity(
-        model, args.model, val_loader, device)
-
-    test_metrics = None
-    test_prior_fidelity = None
-    if test_loader is not None:
-        test_metrics = validate(
-            model, args.model, test_loader, device, tracker)
-        test_prior_fidelity = evaluate_prior_fidelity(
-            model, args.model, test_loader, device)
-        with open(os.path.join(save_dir, 'test_metrics.json'), 'w') as f:
-            json.dump(test_metrics, f, indent=2)
-        print(
-            "  Independent test: "
-            f"F1={test_metrics['F1']:.4f}  "
-            f"IoU={test_metrics['IoU']:.4f}  "
-            f"P={test_metrics['Precision']:.4f}  "
-            f"R={test_metrics['Recall']:.4f}"
-        )
-
-    # 训练结束汇总
-    summary = {
-        'model':      args.model + tag,
-        'best_val_f1': round(best_val_f1, 6),
-        'test_metrics': test_metrics,
-        'epochs':     args.epochs,
-        'epochs_completed': epochs_completed,
-        'lr':         args.lr,
-        'batch_size': args.batch_size,
-        'seed':       args.seed,
-        'data_root':  args.data_root,
-        'split_manifest': manifest_path,
-        'split_counts': {
-            'train': len(train_ds),
-            'val': len(val_ds),
-            'test': len(test_ds) if test_ds is not None else None,
-        },
-        'prior_tag':  args.prior_tag,
-        'alpha':      args.alpha,
-        'prior_control': args.prior_control,
-        'online_use_gating': not args.no_gating,
-        'prior_only_gating': args.prior_only_gating,
-        'spg_lr': args.spg_lr,
-        'spg_gamma_lr': args.spg_gamma_lr or args.spg_lr,
-        'boundary_weight': (
-            args.boundary_weight if args.model == 'BiT_Online_Boundary' else 0.0),
-        'best_checkpoint_gamma': {
-            'spg1': best_gamma1,
-            'spg2': best_gamma2,
-            'max_abs': max(abs(best_gamma1), abs(best_gamma2)),
-        },
-        'val_prior_fidelity': val_prior_fidelity,
-        'test_prior_fidelity': test_prior_fidelity,
-        'patience': args.patience,
-        'amp': amp_enabled,
-        'amp_dtype': args.amp_dtype if amp_enabled else None,
-        'command': ' '.join(os.sys.argv),
-    }
-    summary_path = os.path.join(save_dir, "summary.json")
-    with open(summary_path, 'w') as f:
-        json.dump(summary, f, indent=2)
-
-    print()
-    print("=" * 60)
-    print(f"  Done : {args.model}{tag}  |  Best val F1 = {best_val_f1:.4f}")
-    print(f"  CSV  : {log_path}")
-    print(f"  JSON : {summary_path}")
-    print("=" * 60)
+    amp = args.amp and device.type == "cuda"
+    amp_dtype = torch.float16 if args.amp_dtype == "float16" else torch.bfloat16
+    scaler = torch.amp.GradScaler("cuda", enabled=amp and amp_dtype == torch.float16)
+    best_f1, stale, best_epoch = -1.0, 0, 0
+    started = time.perf_counter()
+    print(f"COAST | {device} | seed {args.seed} | {run_dir}", flush=True)
+    with (run_dir / "training_log.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["epoch", "train_loss", "val_f1", "val_iou", "val_precision", "val_recall", "lr"])
+        for epoch in range(1, args.epochs + 1):
+            loss = train_one_epoch(model, train_loader, criterion, optimizer, device,
+                                   args.alpha, args.boundary_weight, scaler, amp, amp_dtype)
+            metrics = validate(model, val_loader, device)
+            scheduler.step()
+            writer.writerow([epoch, loss, metrics["F1"], metrics["IoU"], metrics["Precision"],
+                             metrics["Recall"], scheduler.get_last_lr()[0]])
+            handle.flush()
+            print(f"Epoch {epoch}/{args.epochs} | loss {loss:.4f} | val F1 {metrics['F1']:.4f}", flush=True)
+            if metrics["F1"] > best_f1:
+                best_f1, stale, best_epoch = metrics["F1"], 0, epoch
+                torch.save(model.state_dict(), run_dir / "best_model.pth")
+            else:
+                stale += 1
+            if args.patience and stale >= args.patience:
+                break
+    training_seconds = time.perf_counter() - started
+    model.load_state_dict(torch.load(run_dir / "best_model.pth", map_location=device, weights_only=True))
+    test_metrics = None if test_loader is None else validate(model, test_loader, device)
+    summary = {"model": "COAST", "seed": args.seed, "best_val_f1": best_f1,
+               "best_epoch": best_epoch, "epochs_completed": epoch,
+               "training_seconds": training_seconds, "test_metrics": test_metrics,
+               "split_counts": {"train": len(train_ds), "val": len(val_ds),
+                                "test": None if test_ds is None else len(test_ds)},
+               "configuration": configuration}
+    (run_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print(json.dumps(summary, indent=2))
 
 
 if __name__ == "__main__":

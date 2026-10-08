@@ -1,55 +1,59 @@
+"""Reproducible initialization, checkpoint loading and pooled pixel metrics."""
+
 import os
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-import torch
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
+import random
+
 import numpy as np
+import torch
+
+
+def set_global_seed(seed, warn_only=False):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.use_deterministic_algorithms(True, warn_only=warn_only)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+
+
+def load_model(checkpoint, device):
+    from models import COAST
+    model = COAST().to(device)
+    model.load_state_dict(torch.load(checkpoint, map_location=device, weights_only=True))
+    return model.eval()
+
 
 class MetricTracker:
-    def __init__(self):
+    def __init__(self, threshold=0.5):
+        if not 0 < threshold < 1:
+            raise ValueError("threshold must be between 0 and 1")
+        self.threshold = threshold
         self.reset()
-        
+
     def reset(self):
-        self.tp = 0
-        self.tn = 0
-        self.fp = 0
-        self.fn = 0
-        
+        self.tp = self.tn = self.fp = self.fn = 0
+
+    @torch.no_grad()
     def update(self, inputs, targets):
-        """
-        累加混淆矩阵 (TP, TN, FP, FN)
-        inputs: 模型的原始输出 logits
-        targets: 0 或 1 的标签
-        """
-        with torch.no_grad():
-            # 1. Sigmoid 激活 (变成 0-1 概率)
-            probs = torch.sigmoid(inputs)
-            
-            # 2. 阈值分割 (大于0.5算变化)
-            preds = (probs > 0.5).long()
-            targets = targets.long()
-            
-            # 3. 计算并累加像素数
-            self.tp += (preds * targets).sum().item()
-            self.tn += ((1 - preds) * (1 - targets)).sum().item()
-            self.fp += (preds * (1 - targets)).sum().item()
-            self.fn += ((1 - preds) * targets).sum().item()
-        
+        predictions = (torch.sigmoid(inputs) > self.threshold).long()
+        targets = targets.long()
+        self.tp += (predictions * targets).sum().item()
+        self.tn += ((1 - predictions) * (1 - targets)).sum().item()
+        self.fp += (predictions * (1 - targets)).sum().item()
+        self.fn += ((1 - predictions) * targets).sum().item()
+
     def get_metrics(self):
-        epsilon = 1e-7 # 防止除以0
-        
-        # 计算全局指标
+        epsilon = 1e-7
         precision = self.tp / (self.tp + self.fp + epsilon)
         recall = self.tp / (self.tp + self.fn + epsilon)
-        f1 = 2 * precision * recall / (precision + recall + epsilon)
-        iou = self.tp / (self.tp + self.fp + self.fn + epsilon)
-        
-        # 总体准确率
-        total_pixels = self.tp + self.tn + self.fp + self.fn
-        oa = (self.tp + self.tn) / (total_pixels + epsilon)
-        
         return {
-            "Precision": precision,
-            "Recall": recall,
-            "F1": f1,
-            "IoU": iou,
-            "OA": oa
+            "Precision": precision, "Recall": recall,
+            "F1": 2 * precision * recall / (precision + recall + epsilon),
+            "IoU": self.tp / (self.tp + self.fp + self.fn + epsilon),
+            "OA": (self.tp + self.tn) / (self.tp + self.tn + self.fp + self.fn + epsilon),
         }

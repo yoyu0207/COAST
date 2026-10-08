@@ -1,2 +1,0 @@
-model,positive_test_blocks,positive_block_macro_f1,positive_block_f1_sd_across_blocks,worst_positive_block_f1,negative_test_blocks,worst_negative_block_area_mae_pp
-SNUNetCDOfficial,3,0.9017895586379464,0.10843490336894446,0.7771076360728083,3,12.12921142578125
